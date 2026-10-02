@@ -1,0 +1,94 @@
+# Caddy reverse proxy for the SMS -> GigaChat gateway.
+#
+# Two subdomains, two separate HTTPS sites, both with automatic TLS
+# (Let's Encrypt, certs managed by Caddy):
+#
+#   sms.example.com/api/mobile/v1  -> Go server (port 3000, phone initiates).
+#   app.example.com/webhook         -> our FastAPI app (Go server posts here).
+#
+# The phone app NEVER needs to expose ports; it initiates the HTTPS
+# connection to sms.DOMAIN.  The Go server POSTs webhooks back to app.DOMAIN.
+#
+# The {$DOMAIN} env var is set by docker-compose (Caddy reads it as a global).
+
+# ---------------------------------------------------------------------------
+# Phone app  <->  Go server
+# Route: sms.{DOMAIN}/*  ->  sms-gateway-server:3000
+# ---------------------------------------------------------------------------
+sms.{$DOMAIN} {
+	# Caddy access log for this site (stdout -> docker json-file logging).
+	log {
+		output file /var/log/caddy/sms.access.log {
+			roll_size 10MiB
+			roll_keep 3
+		}
+	}
+
+	# V2: operational endpoints of the Go server must not be reachable from
+	# the Internet.  These paths expose version, device/connection info and
+	# other internal state; the server's own auth was never designed to be
+	# the outer wall.  Block them at the proxy; legitimate consumers (local
+	# monitoring, SSH tunnels) should reach the Go server directly.
+	# NOTE: /api/3rdparty/v1/health (upstream monitoring, signed) and all
+	# phone-app paths (/api/mobile/v1/*) are intentionally left open.
+	# NOTE: the sms-gateway-worker healthcheck hits http://127.0.0.1:3000/health
+	# INSIDE the worker container - Caddy never sees it, so the block is
+	# safe for the worker healthcheck.
+	@metrics path /metrics /health /health/live /health/ready /health/startup
+	respond @metrics 403
+
+	# The Go server v1.47.4 listens on port 3000.
+	# V1 (rate-limit spoofing): Caddy by default APPENDS the client address to
+	# any incoming X-Forwarded-For; a caller could prepend a fake entry and
+	# make the app (which trusts the first XFF entry for its per-IP rate
+	# limit) see a rotating fake IP.  Setting the header with header_up
+	# REPLACES it with the real socket address of the client.
+	reverse_proxy sms-gateway-server:3000 {
+		header_up X-Forwarded-For "{remote_host}"
+	}
+}
+
+# ---------------------------------------------------------------------------
+# Go server  ->  our FastAPI app  (webhook endpoint)
+# Route: app.{DOMAIN}/webhook, /healthz -> app:8000
+# ---------------------------------------------------------------------------
+app.{$DOMAIN} {
+	log {
+		output file /var/log/caddy/app.access.log {
+			roll_size 10MiB
+			roll_keep 3
+		}
+	}
+
+	# Belt-and-braces cap mirroring webhook.max_body_bytes in config.yaml.
+	# M6: explicit bytes (not "64KB") — the size format is only accepted by
+	# Caddy 2.10+ here (B1 pin: caddy:2.10.2), and plain bytes avoid any
+	# unit-parsing ambiguity. No env indirection needed since Caddyfile is
+	# a static mount anyway.
+	request_body {
+		max_size 65536
+	}
+
+	# Only two paths are needed: webhooks from the Go server, and /healthz
+	# for uptime monitors.  Everything else returns 404.
+	# V1 (rate-limit spoofing): the same XFF replacement as on the sms site -
+	# the app trusts the FIRST XFF entry for its per-IP rate limit, so a
+	# spoofed header must never survive the proxy.
+	@webhook path /webhook
+	@healthz path /healthz
+	reverse_proxy @webhook app:8000 {
+		header_up X-Forwarded-For "{remote_host}"
+	}
+	reverse_proxy @healthz app:8000 {
+		header_up X-Forwarded-For "{remote_host}"
+	}
+
+	# Runtime-verification fix: this 404 MUST be matcher-bound.  Caddy sorts
+	# `respond` before `reverse_proxy` regardless of written order, so a bare
+	# `respond "Not found" 404` here adapted to a catch-all route placed
+	# BEFORE the proxy routes and swallowed /webhook and /healthz with 404s
+	# (caught by the caddy-verify runtime round).  With `not path` the
+	# ordering no longer matters: the two API paths never reach the respond.
+	@not_api not path /webhook /healthz
+	respond @not_api "Not found" 404
+}

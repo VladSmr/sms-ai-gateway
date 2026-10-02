@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+
+# Local configuration and secrets (examples stay tracked)
+config.yaml
+.env
+
+# Runtime data
+data/
+logs/
+*.log
+
+# IDE / IntelliJ
+.idea/
+*.iml
+
+# Transfer / build artifacts (deployment archives)
+*.tar.gz
+
+# OS / editor noise
+.DS_Store
+Thumbs.db
+
+# Editor/OS scratch files
+*.bak
+*.orig
+*~
+*.swp
+*.tmp
+
+# Stray SQLite databases (the real one lives in data/ — see config db_path)
+*.db

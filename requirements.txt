@@ -1,0 +1,9 @@
+# Runtime dependencies (installed in the Docker image; see Dockerfile).
+# Target runtime: Python 3.14 (migration 2026-09-16; pydantic pin per research).
+# Lower bounds are the versions actually exercised by the test suite on 3.14.
+# M5: test-only dependencies (pytest) moved to requirements-dev.txt.
+fastapi>=0.141
+uvicorn>=0.53
+pydantic>=2.13,<2.14
+PyYAML>=6.0.3
+httpx>=0.28

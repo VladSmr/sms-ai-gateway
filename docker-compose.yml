@@ -1,0 +1,242 @@
+# SMS -> GigaChat gateway: app + android-sms-gateway server + MariaDB + Caddy (automatic TLS).
+#
+# Services (two public HTTPS subdomains):
+#
+#   sms.DOMAIN  — the Go server; the phone app connects here (initiates the
+#                  connection, so no port-forwarding on the phone is needed).
+#   app.DOMAIN  — our FastAPI app; the Go server POSTs webhooks here
+#                  (webhooks are registered via the REST API after the phone
+#                  connects — see README "Phone setup", step 3).
+#
+# Routing (Caddyfile):
+#   sms.example.com/* -> sms-gateway-server:3000   (phone <-> Go server)
+#   app.example.com/webhook, /healthz -> app:8000
+#
+# Setup:
+#   1. cp .env.example .env  — fill in all variables (DOMAIN is required)
+#   2. cp config.example.yaml config.yaml  — edit as needed
+#   3. docker compose up -d --build
+#   4. docker compose ps   — verify all services are healthy
+#
+# Smoke run (no real keys):
+#   set MOCK_LLM=true MOCK_GATEWAY=true in .env before `docker compose up`.
+#
+# NOTE on Go server configuration:
+#   The server is configured via a config.yml mounted at /app/config.yml.
+#   All values can be overridden by env vars with SECTION__KEY format
+#   (e.g. DATABASE__HOST, GATEWAY__MODE).  Verify env var names against
+#   the deployed server version at docs.sms-gate.app before production use.
+#   Current compose pins ghcr.io/android-sms-gateway/server:v1.47.4.
+
+x-defaults: &defaults
+  restart: unless-stopped
+  networks:
+    - gateway-net
+  logging:
+    driver: "json-file"
+    options:
+      max-size: "10m"
+      max-file: "3"
+
+services:
+  # --------------------------------------------------------------------------
+  # MariaDB — Go server's persistence (MariaDB LTS recommended by server docs;
+  # 11.8 is the LTS line, 11.5 was short-lived - bumped per review nit).
+  # https://docs.sms-gate.app/features/private-server
+  # --------------------------------------------------------------------------
+  db:
+    image: mariadb:11.8
+    <<: *defaults
+    environment:
+      MARIADB_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-}
+      MARIADB_DATABASE: sms
+      MARIADB_USER: ${MYSQL_DB_USER:-gateway}
+      MARIADB_PASSWORD: ${MYSQL_DB_PASSWORD:-}
+    volumes:
+      - db_data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  # --------------------------------------------------------------------------
+  # android-sms-gateway server v1.47.4 (Go binary, official Docker image)
+  # https://docs.sms-gate.app/features/private-server
+  # https://github.com/android-sms-gateway/server/releases
+  #
+  # CAUTION: env var names are version-specific.  The server reads config.yml
+  # first, then overrides with env vars (SECTION__KEY format).  Always verify
+  # against the running version's documentation before changing values below.
+  # --------------------------------------------------------------------------
+  sms-gateway-server:
+    image: ghcr.io/android-sms-gateway/server:v1.47.4
+    <<: *defaults
+    depends_on:
+      db:
+        condition: service_healthy
+    # Mount the server config (private mode: gateway.mode=private, private_token)
+    volumes:
+      - ./sms-gateway-config.yml:/app/config.yml:ro
+    # Env overrides for settings that differ between deployments.
+    # CAUTION: env var names (SECTION__KEY format) are version-specific —
+    # always verify against the running version at docs.sms-gate.app.
+    # Verified against v1.47.4 config.example.yml (2026-09-17): database.*,
+    # gateway.mode, gateway.private_token, http.listen are real keys.
+    # NOTE: webhooks are NOT configured here — they are registered via the
+    # 3rd-party REST API after the phone connects (see README "Phone setup").
+    environment:
+      # HTTP server (port must be 0.0.0.0 for Caddy to reach it).
+      HTTP__LISTEN: "0.0.0.0:3000"
+      # Trust reverse-proxy subnets so the server sees real client IPs
+      # (http.proxies in config.yml; Docker network is 172.16.0.0/12).
+      # Single source of truth: sms-gateway-config.yml does NOT set
+      # http.proxies - this env override (which wins over config.yml) is
+      # the only place the value is defined.
+      # envconfig splits on COMMAS (confirmed: internal/config/config.go of
+      # the server reads env vars with SECTION__KEY notation).  Spaces are
+      # NOT delimiters - using them would mean none of the subnets are
+      # trusted, and the server would see every request as 0.0.0.0/0.
+      HTTP__PROXIES: "10.0.0.0/8,172.16.0.0/12,192.168.0.0/16"
+      # Database — injected here so they don't appear in sms-gateway-config.yml.
+      # M2: the user is propagated too, so changing MYSQL_DB_USER in .env
+      # cannot drift from sms-gateway-config.yml's `user: gateway` default.
+      DATABASE__USER: ${MYSQL_DB_USER:-gateway}
+      DATABASE__PASSWORD: ${MYSQL_DB_PASSWORD:-}
+      # Private token — must match what the phone app sends
+      # (Settings -> Cloud Server -> Private Token in the Android app).
+      GATEWAY__PRIVATE_TOKEN: ${GATEWAY_PRIVATE_TOKEN:-}
+    healthcheck:
+      # 127.0.0.1 (IPv4 literal), NOT localhost: inside the container
+      # "localhost" can resolve to ::1 (IPv6) first, and the Go server
+      # binds 0.0.0.0:3000 (IPv4 only) - busybox wget then hits ::1 and
+      # gets "Connection refused" even though the server is up (observed
+      # on the production VPS; Docker Desktop on the dev machine happened
+      # to try IPv4 first, masking the issue). The IPv4 literal is
+      # deterministic in any container.
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:3000/api/3rdparty/v1/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
+  # --------------------------------------------------------------------------
+  # android-sms-gateway background worker (W6, privacy compliance).
+  # The docs (docs.sms-gate.app/features/private-server#background-worker)
+  # require a SEPARATE process for cleanup tasks: messages:cleanup removes
+  # stored SMS texts from MariaDB after tasks.messages_cleanup.max_age
+  # (720 h), devices:cleanup, messages:hashing.  Without it, SMS texts
+  # accumulate in the Go server's DB forever.
+  # Command per docs: `/app/app worker` (same image, same config.yml, no
+  # published ports; it only needs the DB and coordinates via MySQL locks).
+  # --------------------------------------------------------------------------
+  sms-gateway-worker:
+    image: ghcr.io/android-sms-gateway/server:v1.47.4
+    <<: *defaults
+    depends_on:
+      db:
+        condition: service_healthy
+      sms-gateway-server:
+        condition: service_healthy
+    volumes:
+      - ./sms-gateway-config.yml:/app/config.yml:ro
+    environment:
+      # Same DB credentials as the main server (the worker owns the cleanup
+      # tasks against the same database; named locks prevent overlap).
+      DATABASE__USER: ${MYSQL_DB_USER:-gateway}
+      DATABASE__PASSWORD: ${MYSQL_DB_PASSWORD:-}
+      # No GATEWAY__PRIVATE_TOKEN here: the worker does not serve devices.
+    command: ["/app/app", "worker"]
+    healthcheck:
+      # The worker process serves its own liveness probe on :3000/health
+      # ({"status":"pass"}); /api/3rdparty/v1/health is NOT mounted in
+      # worker mode, and `app worker --help` actually STARTS a second
+      # server (bind conflict -> exit 1, always unhealthy).
+      # 127.0.0.1, not localhost - same IPv4-literal rationale as on the
+      # sms-gateway-server healthcheck above (::1 vs 0.0.0.0 bind).
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:3000/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+  # --------------------------------------------------------------------------
+  # Our FastAPI application
+  # --------------------------------------------------------------------------
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: sms-ai-gateway:latest
+    <<: *defaults
+    # Runs as non-root user (USER appuser, uid 10001, set in Dockerfile).
+    env_file:
+      - .env
+    environment:
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      GATEWAY_CONFIG: /app/config.yaml
+      GATEWAY_HMAC_SECRET: ${GATEWAY_HMAC_SECRET:-}
+      GIGACHAT_AUTH_KEY: ${GIGACHAT_AUTH_KEY:-}
+      GIGACHAT_API_KEY: ${GIGACHAT_API_KEY:-}
+      MOCK_LLM: ${MOCK_LLM:-}
+      GATEWAY_USERNAME: ${GATEWAY_USERNAME:-}
+      GATEWAY_PASSWORD: ${GATEWAY_PASSWORD:-}
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+      TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
+      MOCK_GATEWAY: ${MOCK_GATEWAY:-}
+    volumes:
+      # Bind-mount config from host so edits are picked up without rebuild.
+      # IMPORTANT: create config.yaml BEFORE the first `docker compose up`,
+      # otherwise Docker creates an empty *directory* at this path.
+      # W4b: the app hot-reloads on mtime, but an editor that REPLACES the
+      # file (new inode, e.g. VS Code default) is invisible to the mount —
+      # after editing run `docker compose restart app` (see README).
+      - ./config.yaml:/app/config.yaml
+      # Persistent SQLite + rotating JSON logs (LOG_FILE=/app/data/logs/app.log).
+      - app_data:/app/data
+    expose:
+      - "8000"
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import sys, urllib.request; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=3).status == 200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+  # --------------------------------------------------------------------------
+  # Caddy reverse proxy — automatic TLS for both subdomains (Let's Encrypt)
+  # Plain-bytes max_size worked in older Caddy too (2.10 added the k/m/g
+  # suffixes); pinned to 2.10.2 per B1 (bumped from 2.9.1, tag verified via
+  # `docker pull caddy:2.10.2`).
+  # --------------------------------------------------------------------------
+  caddy:
+    image: caddy:2.10.2
+    <<: *defaults
+    depends_on:
+      - app
+      - sms-gateway-server
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      DOMAIN: ${DOMAIN:?DOMAIN is required, see .env.example}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+
+networks:
+  gateway-net:
+    driver: bridge
+
+volumes:
+  db_data:
+    driver: local
+  app_data:
+    driver: local
+  caddy_data:
+    driver: local
+  caddy_config:
+    driver: local

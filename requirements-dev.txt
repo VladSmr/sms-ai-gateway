@@ -1,0 +1,6 @@
+# Development / test-only dependencies (M5).
+# Install on top of the runtime requirements:
+#   pip install -r requirements.txt -r requirements-dev.txt
+# NOT installed in the Docker image (runtime stays lean).
+-r requirements.txt
+pytest>=9.1

@@ -1,0 +1,108 @@
+# android-sms-gateway/server configuration
+# All keys can be overridden by env vars with SECTION__KEY format
+# (e.g. DATABASE__HOST, GATEWAY__MODE).
+# Docs: https://docs.sms-gate.app/features/private-server
+# Config reference: configs/config.example.yml in the server repo
+# CAUTION: env var names are version-specific — always verify against the
+# deployed server version at docs.sms-gate.app before production use.
+#
+# IMPORTANT: Sensitive values (passwords, tokens) are NOT stored here.
+# They are injected via docker-compose environment overrides
+# (SECTION__KEY format) so secrets stay in .env and never hit the image.
+
+# ---------------------------------------------------------------------------
+# Database — MariaDB 10.2.7+ / MySQL 8.0.13+
+# The Go server creates migrations automatically on startup.
+# ---------------------------------------------------------------------------
+database:
+  host: db
+  port: 3306
+  user: gateway
+  database: sms
+  timezone: UTC
+
+# ---------------------------------------------------------------------------
+# Gateway — private mode (token-protected device registration)
+# ---------------------------------------------------------------------------
+gateway:
+  mode: private
+  # private_token is injected via GATEWAY__PRIVATE_TOKEN env override.
+  # Must match the "Private Token" entered in the phone app
+  # (Settings -> Cloud Server -> Private Token).
+  private_token: ""   # overridden by GATEWAY__PRIVATE_TOKEN env var
+
+# ---------------------------------------------------------------------------
+# HTTP server
+# ---------------------------------------------------------------------------
+http:
+  # Must be 0.0.0.0 inside Docker so Caddy (on the same network) can reach it.
+  listen: 0.0.0.0:3000
+  # NOTE: trusted proxy subnets (http.proxies) are injected via the
+  # HTTP__PROXIES env override in docker-compose.yml - the env wins over
+  # this file, so it is the single source of truth (kept next to the other
+  # deploy-specific env injections; nothing here to keep in sync).
+  api:
+    # Public API path for private server: /api/3rdparty/v1/*
+    # The phone app connects to: https://sms.DOMAIN/api/mobile/v1
+    host:
+    path: /api
+
+# ---------------------------------------------------------------------------
+# Firebase (public mode only — not used in private mode)
+# ---------------------------------------------------------------------------
+fcm:
+  credentials_json: "{}"
+  timeout_seconds: 1
+  debounce_seconds: 5
+
+# ---------------------------------------------------------------------------
+# SSE keep-alive (phone keeps a long-lived SSE connection open)
+# ---------------------------------------------------------------------------
+sse:
+  keep_alive_period_seconds: 15
+
+# ---------------------------------------------------------------------------
+# Message cache TTL
+# ---------------------------------------------------------------------------
+messages:
+  cache_ttl_seconds: 300
+
+# ---------------------------------------------------------------------------
+# Cache and pubsub (in-process for single-instance private deployment)
+# ---------------------------------------------------------------------------
+cache:
+  url: memory://
+
+pubsub:
+  url: memory://
+
+# ---------------------------------------------------------------------------
+# JWT — disabled (using Basic auth for 3rd-party API)
+# ---------------------------------------------------------------------------
+jwt:
+  secret:
+
+# ---------------------------------------------------------------------------
+# OTP — enabled (one-time code for device registration in private mode)
+# ---------------------------------------------------------------------------
+otp:
+  enabled: true
+  length: 6
+  ttl: 60
+  retries: 3
+
+# ---------------------------------------------------------------------------
+# Background tasks
+# ---------------------------------------------------------------------------
+tasks:
+  messages_hashing:
+    interval: 168h
+  messages_cleanup:
+    interval: 24h
+    max_age: 720h
+  devices_cleanup:
+    interval: 24h
+    max_age: 8760h
+  tokens_cleanup:
+    interval: 24h
+    max_age: 1h

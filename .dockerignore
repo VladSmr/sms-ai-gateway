@@ -1,0 +1,27 @@
+# Keep the build context minimal; the image needs only app/ and requirements.txt.
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+tests/
+
+# Local state and secrets never enter the image
+data/
+logs/
+*.log
+config.yaml
+.env
+
+# Files not needed inside the build context
+.git/
+.gitignore
+Dockerfile
+docker-compose.yml
+Caddyfile
+README.md
+config.example.yaml
+.env.example
+.DS_Store
+Thumbs.db
