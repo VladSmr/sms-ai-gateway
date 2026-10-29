@@ -1,5 +1,7 @@
 # SMS → GigaChat Gateway
 
+Habr - https://habr.com/ru/articles/1092588/
+
 A personal FastAPI service that lets you talk to an AI assistant over plain
 SMS — no mobile internet required. Incoming SMS messages are forwarded as
 webhooks by the [android-sms-gateway](https://sms-gate.app) app running on an
